@@ -1,4 +1,5 @@
 use std::os::raw::c_void;
+use std::sync::{Arc, Condvar, Mutex};
 use std::{
     thread,
     time::{Duration, Instant},
@@ -19,6 +20,7 @@ use core_graphics::{
     },
     event_source::{CGEventSource, CGEventSourceStateID},
 };
+use dispatch::Queue;
 use foreign_types_shared::ForeignTypeRef as _;
 use log::{debug, error, info};
 use objc2::msg_send;
@@ -1040,7 +1042,9 @@ fn get_layoutdependent_keycode(string: &str) -> CGKeyCode {
     // loop through every keycode (0 - 127)
     for keycode in 0..128 {
         // no modifier
-        if let Ok(key_string) = keycode_to_string(keycode, 0x100) {
+        if let Ok(key_string) =
+            run_on_main_thread_blocking(move || keycode_to_string(keycode, 0x100))
+        {
             // debug!("{:?}", string);
             if string == key_string {
                 pressed_keycode = keycode;
@@ -1048,7 +1052,9 @@ fn get_layoutdependent_keycode(string: &str) -> CGKeyCode {
         }
 
         // shift modifier
-        if let Ok(key_string) = keycode_to_string(keycode, 0x20102) {
+        if let Ok(key_string) =
+            run_on_main_thread_blocking(move || keycode_to_string(keycode, 0x20102))
+        {
             // debug!("{:?}", string);
             if string == key_string {
                 pressed_keycode = keycode;
@@ -1066,6 +1072,30 @@ fn get_layoutdependent_keycode(string: &str) -> CGKeyCode {
     }
 
     pressed_keycode
+}
+
+fn run_on_main_thread_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let pair = Arc::new((Mutex::new(None), Condvar::new()));
+    let pair_clone = pair.clone();
+
+    Queue::main().exec_async(move || {
+        let result = f();
+        let (lock, cvar) = &*pair_clone;
+        *lock.lock().unwrap() = Some(result);
+        cvar.notify_one();
+    });
+
+    // Blocking wait for the main thread to complete execution.
+    let (lock, cvar) = &*pair;
+    let mut guard = lock.lock().unwrap();
+    while guard.is_none() {
+        guard = cvar.wait(guard).unwrap();
+    }
+    guard.take().unwrap()
 }
 
 fn keycode_to_string(keycode: u16, modifier: u32) -> Result<String, String> {
